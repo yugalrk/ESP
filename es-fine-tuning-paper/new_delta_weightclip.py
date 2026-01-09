@@ -17,24 +17,25 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct')
-parser.add_argument('--save_dir', type=str, default='es-fine-tuning-paper/finetuned-models')
+parser.add_argument('--save_dir', type=str, default='full_qwen_concise_es_output')
 parser.add_argument('--hf_cache_dir', type=str, default='huggingface_cache')
 parser.add_argument('--precision', type=str, default='bf16')
 parser.add_argument('--gpu_threads', type=int, default=1, help='Number of parallel threads per GPU')
 args = parser.parse_args()
 
-# --- ES Hyperparameters ---
+# --- Stable ES Hyperparameters (Tuned) ---
 NUM_ITERATIONS = 20
 POPULATION_SIZE = 25
-SIGMA = 0.001
-ALPHA = 0.0005
+SIGMA = 0.01          # Increased for better exploration
+ALPHA = 0.0001         # Decreased for weight stability
+CLIPPING_THRESHOLD = 0.1 # Threshold for weight update clipping
 MAX_NEW_TOKENS = 20  
 initial_seed = 33
 
 SYSTEM_PROMPT = "You are a helpful assistant. Give extremely concise answers. Only provide the final result without explanation."
 COMPUTE_DTYPE = torch.bfloat16 if args.precision == 'bf16' else (torch.float16 if args.precision == 'fp16' else torch.float32)
 
-# --- Dataset ---
+# --- Dataset (Subset) ---
 dataset = [
     # --- Simple Arithmetic (Sequencing and Calculation) ---
     ("Solve: 12 + 7 =", "19"),
@@ -151,13 +152,19 @@ dataset = [
 ]
 
 def compute_reward(generated_text, target_text):
+    """Graduated penalty to prevent reward collapse."""
     gen = generated_text.strip().lower()
     tgt = target_text.strip().lower()
-    # Accuracy Bonus: 0 for correct, -100 for incorrect
-    reward = 0.0 if tgt in gen else -100.0
-    # Conciseness Penalty: -0.1 per extra character
-    reward -= (0.1 * abs(len(gen) - len(tgt)))
-    return reward
+    
+    if tgt in gen:
+        accuracy_reward = 0.0
+    elif any(char.isdigit() for char in gen) and any(char.isdigit() for char in tgt):
+        accuracy_reward = -5.0 
+    else:
+        accuracy_reward = -20.0 
+        
+    length_penalty = -0.1 * abs(len(gen) - len(tgt))
+    return accuracy_reward + length_penalty
 
 def force_memory_cleanup():
     gc.collect()
@@ -225,7 +232,6 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     
     metrics_history = []
-
     model_list = []
     for _ in range(args.gpu_threads):
         model = AutoModelForCausalLM.from_pretrained(args.model_name, cache_dir=args.hf_cache_dir, device_map={"": device}, torch_dtype=COMPUTE_DTYPE)
@@ -263,13 +269,12 @@ def main():
         rewards = all_rewards_tensor.cpu().numpy()
         mean_reward, min_reward, max_reward = np.mean(rewards), np.min(rewards), np.max(rewards)
 
-        # Logging metrics
-        iter_data = {"iteration": iteration + 1, "mean": float(mean_reward), "min": float(min_reward), "max": float(max_reward), "time": time.time() - iter_start}
-        metrics_history.append(iter_data)
-
-        # Update Weights
+        # Weight Update with Clipping
         rewards_norm = (rewards - mean_reward) / (np.std(rewards) + 1e-8)
         main_model = model_list[0]
+        total_delta = 0
+        weight_count = 0
+
         for name, param in main_model.named_parameters():
             if "weight" in name:
                 update = torch.zeros_like(param)
@@ -277,13 +282,36 @@ def main():
                     gen = torch.Generator(device=param.device).manual_seed(int(seeds[i]))
                     noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
                     update.add_(noise * rewards_norm[i])
-                param.data.add_(ALPHA / (POPULATION_SIZE * SIGMA) * update)
+                
+                step = (ALPHA / (POPULATION_SIZE * SIGMA) * update)
+                
+                # Apply Weight Clipping for stability
+                step_norm = torch.norm(step)
+                if step_norm > CLIPPING_THRESHOLD:
+                    step = step * (CLIPPING_THRESHOLD / step_norm)
+                
+                param.data.add_(step)
+                total_delta += step.abs().mean().item()
+                weight_count += 1
+
+        avg_weight_delta = total_delta / weight_count if weight_count > 0 else 0
+
+        # Metrics Persistence
+        iter_data = {
+            "iteration": iteration + 1, 
+            "mean": float(mean_reward), 
+            "min": float(min_reward), 
+            "max": float(max_reward), 
+            "weight_delta": avg_weight_delta,
+            "time": time.time() - iter_start
+        }
+        metrics_history.append(iter_data)
 
         for i in range(1, len(model_list)):
             for name, param in model_list[i].named_parameters(): param.data.copy_(main_model.get_parameter(name).data)
 
         if accelerator.is_main_process:
-            print(f"Iter {iteration+1}/{NUM_ITERATIONS} | Mean: {mean_reward:.4f} | Min: {min_reward:.4f} | Max: {max_reward:.4f}")
+            print(f"Iter {iteration+1}/{NUM_ITERATIONS} | Mean: {mean_reward:.4f} | Max: {max_reward:.4f} | Min: {min_reward:.4f} | Delta: {avg_weight_delta:.6f}")
 
     if accelerator.is_main_process:
         main_model.save_pretrained(args.save_dir)

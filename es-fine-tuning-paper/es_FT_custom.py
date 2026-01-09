@@ -18,7 +18,7 @@ logging.set_verbosity_error()
 torch.backends.cuda.matmul.allow_tf32 = True
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-3B-Instruct')
+parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct')
 parser.add_argument('--hf_cache_dir', type=str, default='huggingface_cache')
 parser.add_argument('--precision', type=str, default='bf16')
 parser.add_argument('--gpu_threads', type=int, default=1, help='Number of parallel threads per GPU')
@@ -156,7 +156,7 @@ dataset = [
 def compute_reward(generated_text, target_text):
     # Negative absolute difference in length
     return -abs(len(generated_text) - len(target_text))
-
+ 
 def force_memory_cleanup():
     """Force aggressive memory cleanup"""
     gc.collect()

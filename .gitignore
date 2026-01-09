@@ -1,2 +1,8 @@
 huggingface_cache/
 ES_env/
+finetuned-full/
+fintetuned_lora/
+finetuned-Vlora/
+es-fine-tuning-paper/finetuned-models/
+finetuned-models/
+merged_qwen_lora/

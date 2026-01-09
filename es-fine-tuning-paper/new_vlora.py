@@ -1,40 +1,46 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers.utils import logging
+from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
 import numpy as np
 import os
 import argparse
 import json
 from accelerate import Accelerator
 import time
-import torch.multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
 import gc
 
-# --- Setup ---
+# --- Configuration ---
 logging.set_verbosity_error()
 torch.backends.cuda.matmul.allow_tf32 = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct')
-parser.add_argument('--save_dir', type=str, default='es-fine-tuning-paper/finetuned-models')
+parser.add_argument('--save_dir', type=str, default='./finetuned_vlora_es_output')
 parser.add_argument('--hf_cache_dir', type=str, default='huggingface_cache')
 parser.add_argument('--precision', type=str, default='bf16')
-parser.add_argument('--gpu_threads', type=int, default=1, help='Number of parallel threads per GPU')
 args = parser.parse_args()
 
 # --- ES Hyperparameters ---
 NUM_ITERATIONS = 20
-POPULATION_SIZE = 25
-SIGMA = 0.001
-ALPHA = 0.0005
-MAX_NEW_TOKENS = 20  
+POPULATION_SIZE = 25 
+SIGMA = 0.001        # Reset to your original value
+ALPHA = 0.0005       # Reset to your original value
+MAX_NEW_TOKENS = 50  # Matches your original
 initial_seed = 33
+# --- QLoRA Configuration ---
+LORA_R = 8 
+LORA_ALPHA = 16
 
-SYSTEM_PROMPT = "You are a helpful assistant. Give extremely concise answers. Only provide the final result without explanation."
-COMPUTE_DTYPE = torch.bfloat16 if args.precision == 'bf16' else (torch.float16 if args.precision == 'fp16' else torch.float32)
+if args.precision == 'fp16':
+    COMPUTE_DTYPE = torch.float16
+elif args.precision == 'bf16':
+    COMPUTE_DTYPE = torch.bfloat16
+else:
+    COMPUTE_DTYPE = torch.float32
 
-# --- Dataset ---
+
+# --- Dataset (Exactly as provided in your original script) ---
 dataset = [
     # --- Simple Arithmetic (Sequencing and Calculation) ---
     ("Solve: 12 + 7 =", "19"),
@@ -151,147 +157,150 @@ dataset = [
 ]
 
 def compute_reward(generated_text, target_text):
-    gen = generated_text.strip().lower()
-    tgt = target_text.strip().lower()
-    # Accuracy Bonus: 0 for correct, -100 for incorrect
-    reward = 0.0 if tgt in gen else -100.0
-    # Conciseness Penalty: -0.1 per extra character
-    reward -= (0.1 * abs(len(gen) - len(tgt)))
-    return reward
+    """Matches your original script's reward function exactly."""
+    return -abs(len(generated_text) - len(target_text))
 
 def force_memory_cleanup():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
 
-def format_prompt(tokenizer, user_query):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_query}]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+# --- Vectorized Evaluation Logic ---
 
-def safe_decode(tokenizer, token_ids):
-    try:
-        return tokenizer.decode(token_ids, skip_special_tokens=True)
-    except TypeError:
-        tokens = tokenizer.convert_ids_to_tokens(token_ids, skip_special_tokens=True)
-        valid_tokens = [t for t in tokens if isinstance(t, str)]
-        return tokenizer.convert_tokens_to_string(valid_tokens)
-
-def evaluate_model(model, tokenizer, input_texts, target_texts, accelerator):
-    prompts = [format_prompt(tokenizer, text) for text in input_texts]
-    tokenized = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left").to(accelerator.device)
+def vectorized_evaluate(model, tokenizer, noise_dict, accelerator):
+    """
+    Optimized: Perturb weights once per population member, then evaluate full dataset.
+    Uses the exact prompt format from your original script.
+    """
+    all_pop_rewards = torch.zeros(POPULATION_SIZE, device=accelerator.device)
     
-    with torch.inference_mode():
-        outputs = model.generate(
-            input_ids=tokenized["input_ids"],
-            attention_mask=tokenized["attention_mask"],
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
+    # Matching your original prompt logic (raw string inputs)
+    input_texts = [d[0] for d in dataset]
+    target_texts = [d[1] for d in dataset]
 
-    generated_texts = []
-    for i in range(len(input_texts)):
-        full_decoded = safe_decode(tokenizer, outputs[i])
-        response = full_decoded.split("assistant")[-1].strip()
-        generated_texts.append(response)
+    # Pre-tokenize
+    tokenized = tokenizer(input_texts, return_tensors="pt", padding=True, padding_side="left").to(accelerator.device)
 
-    return [compute_reward(gen, tgt) for gen, tgt in zip(generated_texts, target_texts)]
+    for i in range(POPULATION_SIZE):
+        # 1. Apply i-th noise once to LoRA parameters
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data.add_(noise_dict[name][i])
+        
+        # 2. Evaluate entire dataset for this individual
+        total_reward_for_indiv = 0
+        with torch.inference_mode():
+            outputs = model.generate(
+                input_ids=tokenized["input_ids"],
+                attention_mask=tokenized["attention_mask"],
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id
+            )
+            
+            for j in range(len(dataset)):
+                # Decodes only the new tokens to calculate length reward
+                decoded = tokenizer.decode(outputs[j][tokenized["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+                total_reward_for_indiv += compute_reward(decoded, target_texts[j])
+        
+        all_pop_rewards[i] = total_reward_for_indiv / len(dataset)
 
-def process_seed(seed_args):
-    seed_idx, seed, model, tokenizer, accelerator, thread_id = seed_args
-    for name, param in model.named_parameters():
-        if "weight" in name:
-            gen = torch.Generator(device=param.device).manual_seed(int(seed))
-            noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
-            param.data.add_(SIGMA * noise)
+        # 3. Restore weights
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data.sub_(noise_dict[name][i])
+        
+        force_memory_cleanup()
 
-    input_texts = [d[0] for d in dataset]; target_texts = [d[1] for d in dataset]
-    rewards = evaluate_model(model, tokenizer, input_texts, target_texts, accelerator)
-    avg_reward = sum(rewards) / len(dataset)
-
-    for name, param in model.named_parameters():
-        if "weight" in name:
-            gen = torch.Generator(device=param.device).manual_seed(int(seed))
-            noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
-            param.data.add_(-SIGMA * noise)
-
-    force_memory_cleanup()
-    return seed_idx, avg_reward
+    return all_pop_rewards
 
 def main():
     accelerator = Accelerator()
     device = accelerator.device
     os.makedirs(args.save_dir, exist_ok=True)
-    
-    metrics_history = []
 
-    model_list = []
-    for _ in range(args.gpu_threads):
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, cache_dir=args.hf_cache_dir, device_map={"": device}, torch_dtype=COMPUTE_DTYPE)
-        model.eval(); model_list.append(model)
+    # 1. Initialize QLoRA
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=COMPUTE_DTYPE, bnb_4bit_use_double_quant=True,
+    )
+    lora_config = LoraConfig(
+        r=8, lora_alpha=16,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name, cache_dir=args.hf_cache_dir,
+        device_map={"": device}, quantization_config=bnb_config,
+        torch_dtype=COMPUTE_DTYPE, trust_remote_code=True
+    )
+    model = prepare_model_for_kbit_training(model)
+    model = get_peft_model(model, lora_config)
+    model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
 
+    metrics_history = []
     np.random.seed(initial_seed)
 
-    
-
+    # Training Loop
     for iteration in range(NUM_ITERATIONS):
-        iter_start = time.time()
+        iter_start_time = time.time()
         
-        if accelerator.is_main_process:
-            seeds = np.random.randint(0, 2**30, size=POPULATION_SIZE).tolist()
-            seeds_tensor = torch.tensor(seeds, device=device)
-        else:
-            seeds_tensor = torch.zeros(POPULATION_SIZE, dtype=torch.long, device=device)
+        # 1. Generate Seeds
+        seeds = np.random.randint(0, 2**30, size=POPULATION_SIZE).tolist()
         
-        if accelerator.num_processes > 1: torch.distributed.broadcast(seeds_tensor, src=0)
-        seeds = seeds_tensor.cpu().tolist()
+        # 2. Noise Generation for LoRA params
+        noise_dict = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                noises = []
+                for seed in seeds:
+                    gen = torch.Generator(device=param.device).manual_seed(int(seed))
+                    noises.append(torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype))
+                noise_dict[name] = torch.stack(noises) * SIGMA
 
-        local_seeds = [(idx, s) for idx, s in enumerate(seeds) if idx % accelerator.num_processes == accelerator.process_index]
-        
-        with ThreadPoolExecutor(max_workers=args.gpu_threads) as executor:
-            thread_args = [(idx, s, model_list[i % args.gpu_threads], tokenizer, accelerator, i) for i, (idx, s) in enumerate(local_seeds)]
-            local_rewards = list(executor.map(process_seed, thread_args))
+        # 3. Vectorized (In-Place) Evaluation
+        pop_rewards = vectorized_evaluate(model, tokenizer, noise_dict, accelerator)
 
-        all_rewards_tensor = torch.zeros(POPULATION_SIZE, device=device)
-        for idx, rew in local_rewards: all_rewards_tensor[idx] = rew
-        if accelerator.num_processes > 1: torch.distributed.all_reduce(all_rewards_tensor, op=torch.distributed.ReduceOp.SUM)
-        
-        rewards = all_rewards_tensor.cpu().numpy()
-        mean_reward, min_reward, max_reward = np.mean(rewards), np.min(rewards), np.max(rewards)
+        # 4. Global Update
+        mean_reward = pop_rewards.mean().item()
+        rewards_normalized = (pop_rewards - mean_reward) / (pop_rewards.std() + 1e-8)
 
-        # Logging metrics
-        iter_data = {"iteration": iteration + 1, "mean": float(mean_reward), "min": float(min_reward), "max": float(max_reward), "time": time.time() - iter_start}
+        total_delta = 0
+        weight_count = 0
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                r_norm_expanded = rewards_normalized.view(POPULATION_SIZE, *([1] * len(param.shape)))
+                update = (noise_dict[name] * r_norm_expanded).mean(dim=0)
+                
+                # Applying ALPHA * update / POPULATION_SIZE logic from your original script
+                param.data.add_(update, alpha=ALPHA/SIGMA)
+                
+                total_delta += update.abs().mean().item()
+                weight_count += 1
+
+        avg_weight_delta = total_delta / weight_count if weight_count > 0 else 0
+        
+        # Logging
+        iter_data = {
+            "iteration": iteration + 1, "mean": mean_reward, 
+            "max": pop_rewards.max().item(), "min": pop_rewards.min().item(),
+            "weight_delta": avg_weight_delta, "time": time.time() - iter_start_time
+        }
         metrics_history.append(iter_data)
 
-        # Update Weights
-        rewards_norm = (rewards - mean_reward) / (np.std(rewards) + 1e-8)
-        main_model = model_list[0]
-        for name, param in main_model.named_parameters():
-            if "weight" in name:
-                update = torch.zeros_like(param)
-                for i in range(POPULATION_SIZE):
-                    gen = torch.Generator(device=param.device).manual_seed(int(seeds[i]))
-                    noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
-                    update.add_(noise * rewards_norm[i])
-                param.data.add_(ALPHA / (POPULATION_SIZE * SIGMA) * update)
-
-        for i in range(1, len(model_list)):
-            for name, param in model_list[i].named_parameters(): param.data.copy_(main_model.get_parameter(name).data)
-
         if accelerator.is_main_process:
-            print(f"Iter {iteration+1}/{NUM_ITERATIONS} | Mean: {mean_reward:.4f} | Min: {min_reward:.4f} | Max: {max_reward:.4f}")
+            print(f"Iter {iteration + 1}/{NUM_ITERATIONS}, Time: {iter_data['time']:.2f}s, Mean Reward: {mean_reward:.2f}, Min: {iter_data['min']:.2f}, Max: {iter_data['max']:.2f}")
 
     if accelerator.is_main_process:
-        main_model.save_pretrained(args.save_dir)
+        model.save_pretrained(args.save_dir)
         tokenizer.save_pretrained(args.save_dir)
         with open(os.path.join(args.save_dir, "metrics.json"), "w") as f:
             json.dump(metrics_history, f, indent=4)
         print(f"Training complete. Saved to {args.save_dir}")
 
 if __name__ == "__main__":
-    mp.set_start_method('spawn', force=True)
     main()

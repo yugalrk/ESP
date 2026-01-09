@@ -17,7 +17,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-0.5B-Instruct')
-parser.add_argument('--save_dir', type=str, default='es-fine-tuning-paper/finetuned-models')
+parser.add_argument('--save_dir', type=str, default='full_qwen_concise_es_output')
 parser.add_argument('--hf_cache_dir', type=str, default='huggingface_cache')
 parser.add_argument('--precision', type=str, default='bf16')
 parser.add_argument('--gpu_threads', type=int, default=1, help='Number of parallel threads per GPU')
@@ -151,13 +151,24 @@ dataset = [
 ]
 
 def compute_reward(generated_text, target_text):
+    """Graduated penalty to prevent reward collapse."""
     gen = generated_text.strip().lower()
     tgt = target_text.strip().lower()
-    # Accuracy Bonus: 0 for correct, -100 for incorrect
-    reward = 0.0 if tgt in gen else -100.0
-    # Conciseness Penalty: -0.1 per extra character
-    reward -= (0.1 * abs(len(gen) - len(tgt)))
-    return reward
+    
+    # 1. Accuracy Component (Softened Penalty)
+    if tgt in gen:
+        accuracy_reward = 0.0
+    elif any(char.isdigit() for char in gen) and any(char.isdigit() for char in tgt):
+        # Small penalty if it at least produces numbers for math
+        accuracy_reward = -5.0 
+    else:
+        # Lowered from -100 to allow for better exploration
+        accuracy_reward = -20.0 
+        
+    # 2. Conciseness Penalty
+    length_penalty = -0.1 * abs(len(gen) - len(tgt))
+    
+    return accuracy_reward + length_penalty
 
 def force_memory_cleanup():
     gc.collect()
@@ -170,6 +181,7 @@ def format_prompt(tokenizer, user_query):
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
 def safe_decode(tokenizer, token_ids):
+    """Prevents TypeError if ES noise corrupts token generation."""
     try:
         return tokenizer.decode(token_ids, skip_special_tokens=True)
     except TypeError:
@@ -263,13 +275,12 @@ def main():
         rewards = all_rewards_tensor.cpu().numpy()
         mean_reward, min_reward, max_reward = np.mean(rewards), np.min(rewards), np.max(rewards)
 
-        # Logging metrics
-        iter_data = {"iteration": iteration + 1, "mean": float(mean_reward), "min": float(min_reward), "max": float(max_reward), "time": time.time() - iter_start}
-        metrics_history.append(iter_data)
-
-        # Update Weights
+        # Update Weights and Calculate Weight Delta
         rewards_norm = (rewards - mean_reward) / (np.std(rewards) + 1e-8)
         main_model = model_list[0]
+        total_delta = 0
+        weight_count = 0
+
         for name, param in main_model.named_parameters():
             if "weight" in name:
                 update = torch.zeros_like(param)
@@ -277,13 +288,32 @@ def main():
                     gen = torch.Generator(device=param.device).manual_seed(int(seeds[i]))
                     noise = torch.randn(param.shape, generator=gen, device=param.device, dtype=param.dtype)
                     update.add_(noise * rewards_norm[i])
-                param.data.add_(ALPHA / (POPULATION_SIZE * SIGMA) * update)
+                
+                step = (ALPHA / (POPULATION_SIZE * SIGMA) * update)
+                param.data.add_(step)
+                
+                # Track average weight movement
+                total_delta += step.abs().mean().item()
+                weight_count += 1
+
+        avg_weight_delta = total_delta / weight_count if weight_count > 0 else 0
+
+        # Logging metrics
+        iter_data = {
+            "iteration": iteration + 1, 
+            "mean": float(mean_reward), 
+            "min": float(min_reward), 
+            "max": float(max_reward), 
+            "weight_delta": avg_weight_delta,
+            "time": time.time() - iter_start
+        }
+        metrics_history.append(iter_data)
 
         for i in range(1, len(model_list)):
             for name, param in model_list[i].named_parameters(): param.data.copy_(main_model.get_parameter(name).data)
 
         if accelerator.is_main_process:
-            print(f"Iter {iteration+1}/{NUM_ITERATIONS} | Mean: {mean_reward:.4f} | Min: {min_reward:.4f} | Max: {max_reward:.4f}")
+            print(f"Iter {iteration+1}/{NUM_ITERATIONS} | Mean: {mean_reward:.4f} | Delta: {avg_weight_delta:.6f}")
 
     if accelerator.is_main_process:
         main_model.save_pretrained(args.save_dir)

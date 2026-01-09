@@ -1,5 +1,1 @@
-<<<<<<< HEAD
-# ES-fork
-=======
-# ESP
->>>>>>> 170c06dd8d79fc2d68cd779440e660cb05012e30
+We are attempting to develop a new training paradigm to train LLMs without Data and combining it with Gradient-free training methods to surpass human intelligence frontiers.
